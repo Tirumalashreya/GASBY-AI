@@ -1,0 +1,10 @@
+version: "3"
+
+tunnels:
+  yolo:
+    proto: http
+    addr: 5000
+
+  action:
+    proto: http
+    addr: 5001
