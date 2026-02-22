@@ -1,0 +1,6 @@
+*.pt
+.DS_Store
+*.pyc
+.env
+*.pkl
+*.gif
