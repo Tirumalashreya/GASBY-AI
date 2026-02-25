@@ -1,260 +1,282 @@
-# GASBY-Action-Recog/app.py
+# Gasby_Ai/action_service/app.py
 
 import cv2
 import json
 import os
-import shutil
-import time
 import boto3
 import subprocess
+import traceback
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-
-from service.action_recognition import ActioRecognition, create_json
-from service.commentary_engine import group_events
-from service.hybrid_commentary import generate_hybrid_commentary
-from service.tts_engine import generate_tts_audio_from_events
-
-from utils.s3utils import download_file, upload_file
-from entity.player import Player
 from dotenv import dotenv_values
 
+from service.tracking import build_tracks
+from service.action_recognition import run_action_recognition
+from service.game_intelligence import enrich_game_intelligence
+from service.highlight_engine import generate_highlights
+from service.tts_engine import generate_tts_audio_from_events
+from service.commentary_engine import generate_gemini_commentary
+from service.instagram_engine import post_broadcast_and_highlights
 
-# ===============================
-# LOAD ENV
-# ===============================
+
+# ---------------------------------------------------------
+# ENVIRONMENT
+# ---------------------------------------------------------
 
 env = dotenv_values(".env")
 
-required_keys = [
-    "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_DEFAULT_REGION"
-]
-
-for key in required_keys:
-    if key not in env or not env[key]:
-        raise Exception(f"❌ Missing {key} in .env")
-
-
-# ===============================
-# SAFE S3 INIT
-# ===============================
+IG_ACCESS_TOKEN = env.get("IG_ACCESS_TOKEN")
+IG_USER_ID = env.get("IG_USER_ID")
 
 s3 = boto3.client(
     "s3",
-    aws_access_key_id=env["AWS_ACCESS_KEY_ID"].strip(),
-    aws_secret_access_key=env["AWS_SECRET_ACCESS_KEY"].strip(),
-    region_name=env["AWS_DEFAULT_REGION"].strip()
+    aws_access_key_id=env.get("AWS_ACCESS_KEY_ID"),
+    aws_secret_access_key=env.get("AWS_SECRET_ACCESS_KEY"),
+    region_name="us-east-1"
 )
 
-INPUT_BUCKET = "gasby-reqs"
-MOT_BUCKET = "gasby-mot-resultss"
-ACTION_BUCKET = "gasby-action-result"
+VIDEO_BUCKET = "gasby-reqs"
+DETECTION_BUCKET = "gasby-mot-resultss"
+OUTPUT_BUCKET = "gasby-action-result"
 
 app = Flask(__name__)
 CORS(app)
 
 
-@app.route("/action-predict")
-def health():
-    return "ok"
+# ---------------------------------------------------------
+# BUILD TIMELINE
+# ---------------------------------------------------------
 
+def build_timeline(events, fps):
+    timeline = []
+    for e in events:
+        timeline.append({
+            "timestamp": round(e["frame"] / fps, 2),
+            "type": e.get("type"),
+            "team": e.get("team"),
+            "zone": e.get("zone"),
+            "points": e.get("points"),
+            "intensity": e.get("intensity")
+        })
+    return timeline
+
+
+# ---------------------------------------------------------
+# MAIN ROUTE
+# ---------------------------------------------------------
 
 @app.route("/action-predict/predict", methods=["POST"])
 def predict():
 
-    start_time = time.time()
-    data = request.get_json()
+    uuid = request.json.get("uuid")
 
-    if not data or "uuid" not in data:
-        return jsonify({"error": "uuid missing"}), 400
+    if not uuid:
+        return jsonify({"status": "error", "message": "UUID missing"}), 400
 
-    uuid = data["uuid"]
+    print("\n================ NEW REQUEST ================")
+    print("UUID:", uuid)
+
+    local_path = f"resources/{uuid}"
+    output_path = f"outputs/{uuid}"
+
+    os.makedirs(local_path, exist_ok=True)
+    os.makedirs(output_path, exist_ok=True)
 
     try:
-        # ===============================
-        # 1️⃣ FIND VIDEO
-        # ===============================
-        response = s3.list_objects_v2(
-            Bucket=INPUT_BUCKET,
-            Prefix=f"{uuid}/"
-        )
 
-        objects = response.get("Contents", [])
-        mp4_key = next(
-            (obj["Key"] for obj in objects if obj["Key"].endswith(".mp4")),
-            None
-        )
+        # -------------------------------------------------
+        # DOWNLOAD FROM S3
+        # -------------------------------------------------
 
-        if not mp4_key:
-            return jsonify({"error": "No mp4 found"}), 400
+        print("⬇ Downloading video + detection JSON...")
 
-        mp4_file = os.path.basename(mp4_key)
-        print("📥 Found video:", mp4_file)
+        video_path = f"{local_path}/{uuid}.mp4"
+        json_path = f"{local_path}/frame_level_detection.json"
 
-        # ===============================
-        # 2️⃣ DOWNLOAD FILES
-        # ===============================
-        download_file(INPUT_BUCKET, uuid, f"resources/{uuid}", mp4_file)
-        download_file(MOT_BUCKET, uuid, f"resources/{uuid}", f"{uuid}.json")
+        s3.download_file(VIDEO_BUCKET, f"{uuid}/{uuid}.mp4", video_path)
+        s3.download_file(DETECTION_BUCKET, f"{uuid}/frame_level_detection.json", json_path)
 
-        # ===============================
-        # 3️⃣ LOAD VIDEO (FAST MODE 🚀)
-        # ===============================
-        video_path = f"resources/{uuid}/{mp4_file}"
+        with open(json_path) as f:
+            frame_data = json.load(f)
+
+        # -------------------------------------------------
+        # GET FPS
+        # -------------------------------------------------
+
         cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        cap.release()
 
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        if not fps or fps <= 0:
-            fps = 30
+        print("🎥 FPS:", fps)
 
-        frames = []
-        frame_count = 0
+        # -------------------------------------------------
+        # TRACKING
+        # -------------------------------------------------
 
-        while cap.isOpened():
+        tracked_players = build_tracks(frame_data)
+
+        # -------------------------------------------------
+        # LOAD FRAMES
+        # -------------------------------------------------
+
+        cap = cv2.VideoCapture(video_path)
+        video_frames = []
+
+        while True:
             ret, frame = cap.read()
             if not ret:
                 break
-
-            # 🚀 SPEED BOOST: process every 3rd frame
-            if frame_count % 3 == 0:
-                frame = cv2.resize(frame, (640, 640))
-                frames.append(frame)
-
-            frame_count += 1
+            video_frames.append(frame)
 
         cap.release()
 
-        if not frames:
-            return jsonify({"error": "No frames extracted"}), 400
+        # -------------------------------------------------
+        # ACTION RECOGNITION
+        # -------------------------------------------------
 
-        print("🎬 Frames loaded:", len(frames))
-        print("🎬 FPS:", fps)
+        cnn_events = run_action_recognition(video_frames, tracked_players)
 
-        # ===============================
-        # 4️⃣ LOAD MOT JSON
-        # ===============================
-        with open(f"resources/{uuid}/{uuid}.json", "r") as f:
-            mot_results = json.load(f)
+        # -------------------------------------------------
+        # GAME INTELLIGENCE
+        # -------------------------------------------------
 
-        players = []
-
-        for r in mot_results:
-            player = Player(r["player_id"], r.get("team", "unknown"))
-            player.bboxs = {
-                p["frame"]: p["box"]
-                for p in r.get("positions", [])
-            }
-            player.positions = {
-                p["frame"]: p.get("position_name", "")
-                for p in r.get("positions", [])
-            }
-            player.actions = {}
-            players.append(player)
-
-        # ===============================
-        # 5️⃣ ACTION RECOGNITION
-        # ===============================
-        players, actions = ActioRecognition(frames, players)
-        result_json = create_json(players, actions, frame_len=len(frames))
-
-        os.makedirs(f"outputs/{uuid}", exist_ok=True)
-
-        with open(f"outputs/{uuid}/{uuid}.json", "w") as f:
-            json.dump(result_json, f, indent=4)
-
-        # ===============================
-        # 6️⃣ GROUP EVENTS
-        # ===============================
-        grouped_events = group_events(result_json)
-        print("🧠 Grouped events:", len(grouped_events))
-
-        if not grouped_events:
-            grouped_events = [{
-                "start_frame": 0,
-                "end_frame": 10,
-                "action": "no_action",
-                "intensity": "low"
-            }]
-
-        # ===============================
-        # 7️⃣ GENERATE COMMENTARY
-        # ===============================
-        commentary_output = []
-
-        for event in grouped_events:
-            commentary = generate_hybrid_commentary(event)
-            commentary_output.append(commentary)
-
-        commentary_json_path = f"outputs/{uuid}/{uuid}_commentary.json"
-
-        with open(commentary_json_path, "w") as f:
-            json.dump(commentary_output, f, indent=4)
-
-        # ===============================
-        # 8️⃣ TTS
-        # ===============================
-        audio_path = f"outputs/{uuid}/{uuid}_commentary.mp3"
-
-        print("🎙 Generating TTS Audio...")
-        duration = generate_tts_audio_from_events(
-            commentary_output,
-            audio_path,
-            fps=fps
+        enriched_events = enrich_game_intelligence(
+            players=tracked_players,
+            fps=fps,
+            frame_detections=frame_data,
+            cnn_events=cnn_events
         )
 
-        print("⏱ Audio Duration:", duration)
+        # -------------------------------------------------
+        # FILTER EVENTS
+        # -------------------------------------------------
 
-        if duration <= 0:
-            raise Exception("Audio duration is zero.")
+        filtered_events = []
+        MIN_FRAME_GAP = int(fps * 5)
+        last_frame = -9999
 
-        # ===============================
-        # 9️⃣ MERGE VIDEO + AUDIO
-        # ===============================
-        final_video_path = f"outputs/{uuid}/{uuid}_broadcast.mp4"
+        for e in enriched_events:
+            if e["frame"] - last_frame >= MIN_FRAME_GAP:
+                filtered_events.append(e)
+                last_frame = e["frame"]
 
-        ffmpeg_command = [
-            "ffmpeg",
-            "-y",
+        timeline = build_timeline(filtered_events, fps)
+
+        # -------------------------------------------------
+        # GEMINI COMMENTARY
+        # -------------------------------------------------
+
+        print("🎙 Generating commentary...")
+        commentary = generate_gemini_commentary(timeline)
+
+        if not commentary:
+            print("⚠ Using fallback commentary.")
+            commentary = [{
+                "timestamp": 0.0,
+                "commentary": [
+                    {"speaker": "Mike", "text": "Welcome to tonight’s basketball action!"},
+                    {"speaker": "Sarah", "text": "Both teams are ready to compete."}
+                ]
+            }]
+
+        # -------------------------------------------------
+        # TTS
+        # -------------------------------------------------
+
+        audio_path = f"{output_path}/{uuid}_commentary.mp3"
+
+        tts_success = generate_tts_audio_from_events(commentary, audio_path)
+
+        if not tts_success:
+            print("❌ TTS failed.")
+            return jsonify({"status": "error", "message": "TTS failed"}), 500
+
+        # -------------------------------------------------
+        # MERGE BROADCAST VIDEO
+        # -------------------------------------------------
+
+        final_video = f"{output_path}/{uuid}_broadcast.mp4"
+
+        print("🎬 Merging broadcast video...")
+
+        merge_process = subprocess.run([
+            "ffmpeg", "-y",
             "-i", video_path,
             "-i", audio_path,
-            "-map", "0:v:0",
-            "-map", "1:a:0",
-            "-c:v", "copy",
-            "-shortest",
-            final_video_path
-        ]
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            "-c:a", "aac",
+            final_video
+        ])
 
-        subprocess.run(ffmpeg_command, check=True)
+        if merge_process.returncode != 0 or not os.path.exists(final_video):
+            print("❌ Broadcast video creation failed.")
+            return jsonify({"status": "error", "message": "Broadcast merge failed"}), 500
 
-        # ===============================
-        # 🔟 UPLOAD TO S3
-        # ===============================
-        upload_file(ACTION_BUCKET, uuid, f"{uuid}.json", uuid)
-        upload_file(ACTION_BUCKET, uuid, f"{uuid}_commentary.json", uuid)
-        upload_file(ACTION_BUCKET, uuid, f"{uuid}_commentary.mp3", uuid)
-        upload_file(ACTION_BUCKET, uuid, f"{uuid}_broadcast.mp4", uuid)
+        # -------------------------------------------------
+        # HIGHLIGHTS
+        # -------------------------------------------------
 
-        shutil.rmtree(f"resources/{uuid}", ignore_errors=True)
+        highlight_video_path = f"{output_path}/{uuid}_highlights.mp4"
 
-        total_time = time.time() - start_time
-        print("✅ Total Processing Time:", total_time)
+        generate_highlights(
+            video_path,
+            filtered_events,
+            fps,
+            highlight_video_path
+        )
+
+        # -------------------------------------------------
+        # UPLOAD TO S3
+        # -------------------------------------------------
+
+        print("☁ Uploading to S3...")
+
+        broadcast_key = f"{uuid}/{uuid}_broadcast.mp4"
+        highlight_key = f"{uuid}/{uuid}_highlights.mp4"
+
+        if os.path.exists(final_video):
+            s3.upload_file(final_video, OUTPUT_BUCKET, broadcast_key)
+        else:
+            return jsonify({"status": "error", "message": "Broadcast missing"}), 500
+
+        if os.path.exists(highlight_video_path):
+            s3.upload_file(highlight_video_path, OUTPUT_BUCKET, highlight_key)
+        else:
+            print("⚠ Highlight video not generated. Skipping upload.")
+
+        broadcast_url = f"https://{OUTPUT_BUCKET}.s3.amazonaws.com/{broadcast_key}"
+        highlight_url = f"https://{OUTPUT_BUCKET}.s3.amazonaws.com/{highlight_key}"
+
+        # -------------------------------------------------
+        # INSTAGRAM POST
+        # -------------------------------------------------
+
+        print("🚀 Posting to Instagram...")
+
+        ig_results = post_broadcast_and_highlights(
+            broadcast_url=broadcast_url,
+            highlight_url=highlight_url,
+            access_token=IG_ACCESS_TOKEN,
+            ig_user_id=IG_USER_ID
+        )
+
+        print("📲 Instagram Results:", ig_results)
+
+        print("✅ PROCESS COMPLETE")
 
         return jsonify({
             "status": "success",
-            "uuid": uuid,
-            "processing_time": total_time
-        }), 200
+            "instagram": ig_results
+        })
 
-    except Exception as e:
-        print("❌ ERROR:", str(e))
-        return jsonify({
-            "status": "error",
-            "message": str(e)
-        }), 500
+    except Exception:
+        print("🔥 ERROR OCCURRED")
+        print(traceback.format_exc())
+        return jsonify({"status": "error"}), 500
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5001, debug=True)
+    app.run(port=5001, debug=False)

@@ -1,105 +1,182 @@
-# service/tts_engine.py
+# Gasby_Ai/action_service/service/tts_engine.py
 
 import os
-from google.cloud import texttospeech
-from google.oauth2 import service_account
-from pydub import AudioSegment
+import requests
+import base64
+import subprocess
+from dotenv import dotenv_values
 
-SERVICE_ACCOUNT_PATH = "/Users/vyju/GASBY-Action-Recognition/gasby-tts-86f12d85ba68.json"
+env = dotenv_values(".env")
+
+API_KEY = env.get("GOOGLE_TTS_API_KEY")
+GOOGLE_TTS_URL = "https://texttospeech.googleapis.com/v1/text:synthesize"
 
 
-def generate_tts_audio_from_events(events, output_path, fps=30):
+# ---------------------------------------------------------
+# GOOGLE TTS SYNTHESIZER
+# ---------------------------------------------------------
+
+def synthesize(text, voice_name, output_file):
+
+    if not API_KEY:
+        print("❌ GOOGLE_TTS_API_KEY missing in .env")
+        return False
+
+    print("\n🎤 Sending to Google TTS:")
+    print("Text:", text[:80])
+    print("Voice:", voice_name)
+
+    payload = {
+        "input": {"text": text},
+        "voice": {
+            "languageCode": "en-US",
+            "name": voice_name
+        },
+        "audioConfig": {
+            "audioEncoding": "MP3"
+        }
+    }
+
+    response = requests.post(
+        GOOGLE_TTS_URL,
+        params={"key": API_KEY},
+        json=payload
+    )
+
+    print("🔎 TTS Status Code:", response.status_code)
+
+    if response.status_code != 200:
+        print("❌ TTS Error Response:")
+        print(response.text)
+        return False
+
+    data = response.json()
+
+    if "audioContent" not in data:
+        print("❌ No audioContent in TTS response")
+        print(data)
+        return False
+
+    with open(output_file, "wb") as f:
+        f.write(base64.b64decode(data["audioContent"]))
+
+    print("✅ Audio clip generated:", output_file)
+
+    return True
+
+
+# ---------------------------------------------------------
+# GENERATE FULL COMMENTARY AUDIO
+# ---------------------------------------------------------
+
+def generate_tts_audio_from_events(events, output_path):
+
+    if not events:
+        print("⚠ No commentary events. Skipping TTS.")
+        return False
+
+    if not isinstance(events, list):
+        print("❌ Commentary format invalid. Expected list.")
+        print("Type received:", type(events))
+        return False
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    print("🎙 Using Google Cloud Text-to-Speech")
-
-    credentials = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_PATH
-    )
-
-    client = texttospeech.TextToSpeechClient(credentials=credentials)
-
-    final_audio = AudioSegment.empty()
-    generated_segments = 0
-
-    # 🚨 If no events at all
-    if not events:
-        print("⚠ No commentary events found. Generating fallback audio.")
-        events = [{
-            "commentary": [{
-                "commentator": "system",
-                "text": "Game analysis complete."
-            }]
-        }]
+    temp_files = []
+    index = 0
 
     for event in events:
 
-        commentary_lines = event.get("commentary", [])
-        if not commentary_lines:
+        # Skip invalid entries
+        if not isinstance(event, dict):
+            print("⚠ Skipping invalid event (not dict):", event)
             continue
 
-        for line in commentary_lines:
+        # -------------------------------------------------
+        # CASE 1: NEW GEMINI FORMAT
+        # { "speaker": "...", "timestamp": ..., "comment": "..." }
+        # -------------------------------------------------
+        if "comment" in event:
 
-            text = line.get("text", "").strip()
-            speaker = line.get("commentator", "system").strip().lower()
+            speaker = event.get("speaker")
+            text = event.get("comment")
 
             if not text:
                 continue
 
-            synthesis_input = texttospeech.SynthesisInput(text=text)
+            temp_file = f"temp_{index}.mp3"
+            voice = "en-US-Neural2-D" if speaker == "Mike" else "en-US-Neural2-F"
 
-            if speaker == "playbyplay":
-                voice = texttospeech.VoiceSelectionParams(
-                    language_code="en-US",
-                    name="en-US-Neural2-D"
-                )
-            else:
-                voice = texttospeech.VoiceSelectionParams(
-                    language_code="en-US",
-                    name="en-US-Neural2-F"
-                )
+            if synthesize(text, voice, temp_file):
+                temp_files.append(temp_file)
+                index += 1
 
-            audio_config = texttospeech.AudioConfig(
-                audio_encoding=texttospeech.AudioEncoding.MP3
-            )
+        # -------------------------------------------------
+        # CASE 2: OLD STRUCTURE
+        # { "commentary": [ {speaker,text}, ... ] }
+        # -------------------------------------------------
+        elif "commentary" in event:
 
-            response = client.synthesize_speech(
-                input=synthesis_input,
-                voice=voice,
-                audio_config=audio_config
-            )
+            commentary_list = event.get("commentary", [])
 
-            if not response.audio_content:
-                print("⚠ Empty audio content from Google TTS, skipping.")
+            if not isinstance(commentary_list, list):
                 continue
 
-            temp_file = os.path.join(os.path.dirname(output_path), "temp.mp3")
+            for line in commentary_list:
 
-            with open(temp_file, "wb") as out:
-                out.write(response.audio_content)
+                if not isinstance(line, dict):
+                    continue
 
-            try:
-                segment = AudioSegment.from_mp3(temp_file)
-                final_audio += segment
-                final_audio += AudioSegment.silent(duration=400)
-                generated_segments += 1
-            except Exception as e:
-                print("⚠ Error reading generated mp3:", e)
+                speaker = line.get("speaker")
+                text = line.get("text")
 
-            os.remove(temp_file)
+                if not text:
+                    continue
 
-    # 🚨 If still nothing generated
-    if generated_segments == 0:
-        print("⚠ No valid TTS segments created. Generating emergency fallback.")
-        fallback = AudioSegment.silent(duration=1000)
-        final_audio = fallback
+                temp_file = f"temp_{index}.mp3"
+                voice = "en-US-Neural2-D" if speaker == "Mike" else "en-US-Neural2-F"
 
-    final_audio.export(output_path, format="mp3")
+                if synthesize(text, voice, temp_file):
+                    temp_files.append(temp_file)
+                    index += 1
 
-    duration_seconds = len(final_audio) / 1000.0
+    # ---------------------------------------------------------
+    # IF NO AUDIO CREATED
+    # ---------------------------------------------------------
+    if not temp_files:
+        print("⚠ No audio clips generated.")
+        return False
 
-    print(f"🎧 Audio saved locally at: {output_path}")
-    print(f"⏱ Audio Duration: {duration_seconds:.2f} seconds")
+    print("\n🔊 Merging audio clips...")
 
-    return duration_seconds
+    with open("file_list.txt", "w") as f:
+        for file in temp_files:
+            f.write(f"file '{file}'\n")
+
+    merge_process = subprocess.run([
+        "ffmpeg", "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", "file_list.txt",
+        "-c", "copy",
+        output_path
+    ])
+
+    if merge_process.returncode != 0:
+        print("❌ FFmpeg merge failed.")
+        return False
+
+    # Cleanup
+    for file in temp_files:
+        if os.path.exists(file):
+            os.remove(file)
+
+    if os.path.exists("file_list.txt"):
+        os.remove("file_list.txt")
+
+    if not os.path.exists(output_path):
+        print("❌ Final merged MP3 not created.")
+        return False
+
+    print("✅ Commentary audio created:", output_path)
+    return True

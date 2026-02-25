@@ -1,69 +1,89 @@
-# service/commentary_engine.py
+# Gasby_Ai/action_service/service/commentary_engine.py
+
+import requests
+import json
+import re
+from dotenv import dotenv_values
+
+env = dotenv_values(".env")
+GEMINI_API_KEY = env.get("GEMINI_API_KEY")
+
+GEMINI_MODEL = "models/gemini-2.5-flash"
+
+GEMINI_URL = (
+    f"https://generativelanguage.googleapis.com/v1/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+)
 
 
-def group_events(action_data):
-    """
-    Groups consecutive frames with same player + same action
-    and adds intensity to each grouped event
-    """
+def clean_response(text):
+    if not text:
+        return None
 
-    if not action_data:
+    text = text.strip()
+    text = re.sub(r"```json", "", text)
+    text = re.sub(r"```", "", text)
+
+    match = re.search(r"\[.*\]", text, re.DOTALL)
+    return match.group(0) if match else None
+
+
+def generate_gemini_commentary(timeline):
+
+    if not timeline:
+        print("⚠ No timeline for commentary.")
         return []
 
-    # Sort by frame
-    action_data = sorted(action_data, key=lambda x: x["frame"])
+    system_prompt = """
+You are a professional basketball broadcast team.
 
-    events = []
+There are TWO commentators:
+1. Mike – High energy play-by-play
+2. Sarah – Tactical analyst
 
-    current_event = {
-        "player": action_data[0]["player"],
-        "action": action_data[0]["action"],
-        "team": action_data[0]["team"],
-        "start_frame": action_data[0]["frame"],
-        "end_frame": action_data[0]["frame"]
+Rules:
+- Alternate speakers
+- Mention timestamps in seconds (numeric)
+- Return ONLY valid JSON array
+- No markdown
+"""
+
+    user_prompt = f"Game timeline:\n{json.dumps(timeline, indent=2)}"
+
+    payload = {
+        "contents": [{
+            "parts": [{"text": system_prompt + "\n\n" + user_prompt}]
+        }]
     }
 
-    for entry in action_data[1:]:
+    try:
+        response = requests.post(
+            GEMINI_URL,
+            json=payload,
+            headers={"Content-Type": "application/json"}
+        )
 
-        if (
-            entry["player"] == current_event["player"]
-            and entry["action"] == current_event["action"]
-            and entry["frame"] == current_event["end_frame"] + 1
-        ):
-            # Extend current event
-            current_event["end_frame"] = entry["frame"]
-        else:
-            events.append(current_event)
+        response_json = response.json()
 
-            current_event = {
-                "player": entry["player"],
-                "action": entry["action"],
-                "team": entry["team"],
-                "start_frame": entry["frame"],
-                "end_frame": entry["frame"]
-            }
+        print("\n🔎 FULL GEMINI RAW RESPONSE:\n")
+        print(json.dumps(response_json, indent=2))
+        print("========================================================\n")
 
-    events.append(current_event)
+        if "error" in response_json:
+            print("❌ Gemini API Error:", response_json["error"])
+            return []
 
-    # Add intensity to each event
-    for event in events:
-        event["intensity"] = get_intensity(event["action"])
+        candidates = response_json.get("candidates", [])
+        if not candidates:
+            return []
 
-    return events
+        raw_text = candidates[0]["content"]["parts"][0]["text"]
 
+        cleaned = clean_response(raw_text)
+        if not cleaned:
+            return []
 
-def get_intensity(action):
-    """
-    Returns intensity level based on action
-    """
+        return json.loads(cleaned)
 
-    high = ["shoot", "block"]
-    medium = ["run", "ball in hand", "pass"]
-    low = ["walk", "no_action"]
-
-    if action in high:
-        return "high"
-    elif action in medium:
-        return "medium"
-    else:
-        return "low"
+    except Exception as e:
+        print("❌ Gemini request failed:", e)
+        return []

@@ -1,247 +1,92 @@
+# Gasby-Ai/Yolo_service/player_tracking.py
+
 import json
 import numpy as np
 import cv2
 import math
-from scipy.optimize import linear_sum_assignment
-from json_convert import json_convert
 
-
-class KalmanFilter:
-    def __init__(self):
-        self.kalman = cv2.KalmanFilter(4, 2)
-        self.kalman.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], np.float32)
-        self.kalman.transitionMatrix = np.array([[1, 0, 1, 0], [0, 1, 0, 1],
-                                                 [0, 0, 1, 0], [0, 0, 0, 1]], np.float32)
-        self.kalman.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
-        self.kalman.measurementNoiseCov = np.eye(2, dtype=np.float32)
-
-    def predict(self):
-        pred = self.kalman.predict()
-        return pred[0], pred[1]
-
-    def correct(self, x, y):
-        measurement = np.array([[np.float32(x)], [np.float32(y)]])
-        self.kalman.correct(measurement)
+MAX_DISTANCE = 80  # threshold for same player matching
 
 
 class Player:
-    def __init__(self, player_id, initial_position, bbox, position_name, uniform_color):
+    def __init__(self, player_id, bbox):
         self.player_id = player_id
-        self.kalman_filter = KalmanFilter()
-        self.kalman_filter.correct(initial_position[0], initial_position[1])
-        self.position = initial_position
-        self.position_name = position_name
-        self.bbox = bbox
-        self.uniform_color = uniform_color
-        self.missed_frames = 0
+        self.bboxes = {}
+        self.last_center = None
 
 
-def calculate_distance(x1, y1, x2, y2):
-    return math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+def calculate_center(box):
+    x1, y1, x2, y2 = box
+    return ((x1 + x2) / 2, (y1 + y2) / 2)
 
 
-def get_player_positions(detections):
+def distance(p1, p2):
+    return math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
 
-    positions = []
-    bboxes = []
-    position_names = []
-    uniform_colors = []
-    basketball_positions = []
 
-    for detection in detections:
+def match_player(existing_players, box, frame_index, next_id):
 
-        if detection['name'] == 'player' and detection['confidence'] > 0.5:
+    center = calculate_center(box)
 
-            box = detection['box']
-            x_center = (box['x1'] + box['x2']) / 2
-            y_center = (box['y1'] + box['y2']) / 2
+    best_match = None
+    min_dist = float("inf")
 
-            positions.append((x_center, y_center))
-            bboxes.append((box['x1'], box['y1'], box['x2'], box['y2']))
-            position_names.append(detection.get('position_name'))
-            uniform_colors.append(detection.get('uniform_color'))
-
-        elif detection['name'] == 'basketball':
-
-            box = detection['box']
-            x_center = (box['x1'] + box['x2']) / 2
-            y_center = (box['y1'] + box['y2']) / 2
-
-            basketball_positions.append({
-                "basketball": detection,
-                "center": (x_center, y_center)
-            })
-
-    # SAFE basketball matching
-    for basketball in basketball_positions:
-
-        if len(positions) == 0:
+    for player in existing_players:
+        if player.last_center is None:
             continue
 
-        min_dis = float("inf")
-        min_ind = -1
+        d = distance(center, player.last_center)
 
-        for i, position in enumerate(positions):
+        if d < min_dist and d < MAX_DISTANCE:
+            min_dist = d
+            best_match = player
 
-            dis = calculate_distance(
-                position[0], position[1],
-                basketball['center'][0], basketball['center'][1]
-            )
+    if best_match:
+        best_match.bboxes[frame_index] = box
+        best_match.last_center = center
+        return best_match, next_id
 
-            if dis < min_dis:
-                min_dis = dis
-                min_ind = i
-
-        if min_ind != -1:
-            basketball['player_bbox'] = bboxes[min_ind]
-            basketball['dis'] = min_dis
-
-    return positions, bboxes, position_names, uniform_colors, basketball_positions
+    # New player
+    new_player = Player(next_id, box)
+    new_player.bboxes[frame_index] = box
+    new_player.last_center = center
+    existing_players.append(new_player)
+    return new_player, next_id + 1
 
 
-def compute_iou(boxA, boxB):
-    xA = max(boxA[0], boxB[0])
-    yA = max(boxA[1], boxB[1])
-    xB = min(boxA[2], boxB[2])
-    yB = min(boxA[3], boxB[3])
-
-    interArea = max(0, xB - xA + 1) * max(0, yB - yA + 1)
-
-    boxAArea = (boxA[2] - boxA[0] + 1) * (boxA[3] - boxA[1] + 1)
-    boxBArea = (boxB[2] - boxB[0] + 1) * (boxB[3] - boxB[1] + 1)
-
-    if boxAArea + boxBArea - interArea == 0:
-        return 0
-
-    return interArea / float(boxAArea + boxBArea - interArea)
-
-
-def match_players(predicted_positions, curr_bboxes):
-
-    if len(predicted_positions) == 0 or len(curr_bboxes) == 0:
-        return [], [], None
-
-    cost_matrix = np.zeros((len(predicted_positions), len(curr_bboxes)))
-
-    for i, pred in enumerate(predicted_positions):
-        for j, curr in enumerate(curr_bboxes):
-            cost_matrix[i, j] = -compute_iou(pred, curr)
-
-    row_ind, col_ind = linear_sum_assignment(cost_matrix)
-
-    return row_ind, col_ind, cost_matrix
-
-
-MAX_MISSED_FRAMES = 5
-
-
-def track_players(players, player_id_counter,
-                  curr_positions, curr_bboxes,
-                  position_names, uniform_colors):
-
-    if not players:
-
-        for pos, bbox, name, color in zip(
-                curr_positions, curr_bboxes,
-                position_names, uniform_colors):
-
-            players.append(Player(player_id_counter, pos, bbox, name, color))
-            player_id_counter += 1
-
-    else:
-
-        row_ind, col_ind, cost_matrix = match_players(
-            [p.bbox for p in players],
-            curr_bboxes
-        )
-
-        assigned = set()
-
-        for r, c in zip(row_ind, col_ind):
-
-            if cost_matrix is not None and -cost_matrix[r, c] > 0.3:
-
-                players[r].kalman_filter.correct(
-                    curr_positions[c][0],
-                    curr_positions[c][1]
-                )
-
-                players[r].position = curr_positions[c]
-                players[r].bbox = curr_bboxes[c]
-                players[r].missed_frames = 0
-                players[r].position_name = position_names[c]
-                players[r].uniform_color = uniform_colors[c]
-
-                assigned.add(c)
-
-        for i, (pos, bbox, name, color) in enumerate(
-                zip(curr_positions, curr_bboxes,
-                    position_names, uniform_colors)):
-
-            if i not in assigned:
-                players.append(Player(player_id_counter, pos, bbox, name, color))
-                player_id_counter += 1
-
-        for player in players:
-            player.missed_frames += 1
-
-        players[:] = [
-            p for p in players
-            if p.missed_frames <= MAX_MISSED_FRAMES
-        ]
-
-    return player_id_counter
-
-
-def player_tracking(source, teamA, teamB):
+def player_tracking(source):
 
     with open(source + '/data.json') as f:
         frames = json.load(f)
 
-    tracked_results = []
-    ball_results = []
     players = []
-    player_id_counter = 0
+    next_id = 0
+    output = []
 
-    for frame_index, frame_data in enumerate(frames):
+    for frame_index, detections in enumerate(frames):
 
-        curr_positions, curr_bboxes, names, colors, basketball_positions = \
-            get_player_positions(frame_data)
+        for detection in detections:
 
-        player_id_counter = track_players(
-            players, player_id_counter,
-            curr_positions, curr_bboxes,
-            names, colors
-        )
+            if detection.get("name") != "player":
+                continue
 
-        frame_results = []
+            box = (
+                detection["box"]["x1"],
+                detection["box"]["y1"],
+                detection["box"]["x2"],
+                detection["box"]["y2"]
+            )
 
-        for player in players:
+            player, next_id = match_player(players, box, frame_index, next_id)
 
-            frame_results.append({
-                'player_id': player.player_id,
-                'position_name': player.position_name,
-                'position': player.position,
-                'box': player.bbox,
-                'uniform_color': player.uniform_color
+            output.append({
+                "player_id": player.player_id,
+                "frame": frame_index,
+                "bbox": box
             })
 
-            for basketball in basketball_positions:
+    with open(source + '/tracked_players.json', 'w') as f:
+        json.dump(output, f, indent=4)
 
-                if basketball.get('player_bbox') == player.bbox:
-                    ball_results.append({
-                        'player_id': player.player_id,
-                        'ball': basketball['basketball'],
-                        'dis': basketball.get('dis'),
-                        'frame': frame_index
-                    })
-
-        tracked_results.append(frame_results)
-
-    with open(source + '/tracked_results.json', 'w') as f:
-        json.dump(tracked_results, f, indent=4)
-
-    with open(source + '/ball.json', 'w') as f:
-        json.dump(ball_results, f, indent=4)
-
-    json_convert(source, teamA, teamB)
+    print("✅ Player tracking complete")
+    return players

@@ -1,14 +1,14 @@
-from __future__ import print_function
-import os
-import cv2
-import numpy as np
-from easydict import EasyDict
+# Gasby-Ai/action_service/service/action_recognition.py
 
+# Gasby-Ai/action_service/service/action_recognition.py
+
+from __future__ import print_function
+import numpy as np
+import cv2
+from easydict import EasyDict
 import torch
 import torch.nn as nn
 from torchvision import models
-from torchvision.models.video import R2Plus1D_18_Weights
-
 from utils.checkpoints import load_weights
 
 
@@ -18,11 +18,10 @@ from utils.checkpoints import load_weights
 
 args = EasyDict({
 
-    # Action Recognition
     'base_model_name': 'r2plus1d_multiclass',
-    'pretrained': False,  # 🔥 IMPORTANT: we load our own weights
+    'start_epoch': 24,
     'lr': 0.0001,
-    'start_epoch': 24,    # 🔥 MUST MATCH YOUR FILE NAME
+
     'num_classes': 10,
 
     'labels': {
@@ -35,177 +34,129 @@ args = EasyDict({
         "6": "defense",
         "7": "pick",
         "8": "no_action",
-        "9": "walk",
-        "10": "discard"
+        "9": "walk"
     },
 
     'model_path': "model_checkpoints/r2plus1d_augmented-2/",
-    'history_path': "histories/history_r2plus1d_augmented-2.txt",
 
-    'seq_length': 16,
-    'vid_stride': 8
+    # 🔥 Increased stride for speed
+    'seq_length': 8,
+    'vid_stride': 16   # was 8 → now 16 (2x faster)
 })
 
 
 # =====================================================
-# VIDEO CROPPING
+# LOAD MODEL
 # =====================================================
 
-def cropVideo(clip, crop_window, max_w, max_h):
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    video = []
+print("🔥 Loading 3D CNN Action Model...")
 
-    for i, frame in enumerate(clip):
+ACTION_MODEL = models.video.r2plus1d_18(weights=None)
 
-        x1 = int(crop_window[i][0])
-        y1 = int(crop_window[i][1])
-        x2 = int(crop_window[i][2])
-        y2 = int(crop_window[i][3])
+num_ftrs = ACTION_MODEL.fc.in_features
+ACTION_MODEL.fc = nn.Linear(num_ftrs, args.num_classes)
 
-        cropped_frame = frame[y1:y2, x1:x2]
+ACTION_MODEL = load_weights(ACTION_MODEL, args)
+ACTION_MODEL = ACTION_MODEL.to(device)
+ACTION_MODEL.eval()
+
+print("✅ 3D CNN Ready")
+
+
+# =====================================================
+# SAFE CROP
+# =====================================================
+
+def cropVideo(clip, crop_window):
+
+    processed = []
+
+    min_len = min(len(clip), len(crop_window))
+
+    for i in range(min_len):
+
+        frame = clip[i]
+        h, w, _ = frame.shape
 
         try:
-            resized_frame = cv2.resize(
-                cropped_frame,
-                (128, 176),
-                interpolation=cv2.INTER_NEAREST
-            )
+            x1, y1, x2, y2 = map(int, crop_window[i])
         except:
-            resized_frame = np.zeros((176, 128, 3), dtype=np.uint8)
-
-        video.append(resized_frame)
-
-    return video
-
-
-def cropWindows(vidFrames, players, seq_length=16, vid_stride=8):
-
-    player_frames = {}
-
-    for p_idx, player in enumerate(players):
-
-        player_frames[p_idx] = []
-
-        bbox_items = list(player.bboxs.items())
-
-        if len(bbox_items) < seq_length:
+            processed.append(np.zeros((176, 128, 3), dtype=np.uint8))
             continue
 
-        for clip_start in range(0, len(bbox_items) - seq_length + 1, vid_stride):
+        x1 = max(0, min(x1, w - 1))
+        x2 = max(0, min(x2, w - 1))
+        y1 = max(0, min(y1, h - 1))
+        y2 = max(0, min(y2, h - 1))
 
-            clip_boxes = bbox_items[clip_start: clip_start + seq_length]
+        if x2 <= x1 or y2 <= y1:
+            resized = np.zeros((176, 128, 3), dtype=np.uint8)
+        else:
+            cropped = frame[y1:y2, x1:x2]
+            resized = cv2.resize(cropped, (128, 176))
 
+        processed.append(resized)
+
+    return processed
+
+
+# =====================================================
+# OPTIMIZED 3D CNN PIPELINE
+# =====================================================
+
+def run_action_recognition(videoFrames, tracked_players):
+
+    print("🎯 Running Optimized 3D CNN Action Recognition...")
+
+    cnn_events = []
+
+    for player in tracked_players:
+
+        bbox_items = sorted(player.bboxes.items())
+
+        # 🔥 Skip very short tracks
+        if len(bbox_items) < args.seq_length:
+            continue
+
+        for start in range(0, len(bbox_items) - args.seq_length + 1, args.vid_stride):
+
+            clip_boxes = bbox_items[start:start + args.seq_length]
             frame_indices = [f[0] for f in clip_boxes]
 
-            if frame_indices[-1] >= len(vidFrames):
+            clip_frames = []
+            for idx in frame_indices:
+                if idx < len(videoFrames):
+                    clip_frames.append(videoFrames[idx])
+
+            if len(clip_frames) != args.seq_length:
                 continue
 
-            clip_frames = vidFrames[
-                frame_indices[0]: frame_indices[-1] + 1
-            ]
-
             crop_boxes = [f[1] for f in clip_boxes]
+            cropped = cropVideo(clip_frames, crop_boxes)
 
-            cropped_video = cropVideo(
-                clip_frames,
-                crop_boxes,
-                0,
-                0
-            )
+            if len(cropped) != args.seq_length:
+                continue
 
-            if len(cropped_video) == seq_length:
-                player_frames[p_idx].append(cropped_video)
+            input_array = np.array(cropped, dtype=np.float32) / 255.0
+            input_tensor = torch.tensor(input_array).unsqueeze(0)
+            input_tensor = input_tensor.permute(0, 4, 1, 2, 3).to(device)
 
-    return player_frames
+            with torch.no_grad():
+                output = ACTION_MODEL(input_tensor)
+                _, pred = torch.max(output, 1)
 
+            action_label = args.labels.get(str(pred.item()), "unknown")
 
-# =====================================================
-# INFERENCE
-# =====================================================
+            if action_label not in ["no_action", "unknown"]:
 
-def inference_batch(batch):
-    return batch.permute(0, 4, 1, 2, 3)
-
-
-def ActioRecognition(videoFrames, players):
-
-    frames = cropWindows(
-        videoFrames,
-        players,
-        seq_length=args.seq_length,
-        vid_stride=args.vid_stride
-    )
-
-    if not frames:
-        return players, {}
-
-    print("Number of players tracked:", len(frames))
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # 🔥 Load model WITHOUT downloading pretrained weights
-    model = models.video.r2plus1d_18(weights=None)
-
-    num_ftrs = model.fc.in_features
-    model.fc = nn.Linear(num_ftrs, args.num_classes)
-
-    # 🔥 Load your trained weights
-    model = load_weights(model, args)
-
-    model = model.to(device)
-    model.eval()
-
-    predictions = {}
-    drop_list = []
-
-    for p_id, player in enumerate(players):
-
-        if p_id not in frames or len(frames[p_id]) == 0:
-            drop_list.append(p_id)
-            continue
-
-        input_frames_np = np.array(frames[p_id])
-
-        input_tensor = torch.tensor(
-            input_frames_np,
-            dtype=torch.float
-        ).to(device)
-
-        input_tensor = inference_batch(input_tensor)
-
-        with torch.no_grad():
-            outputs = model(input_tensor)
-            _, preds = torch.max(outputs, 1)
-
-        predictions[p_id] = preds.cpu().numpy().tolist()
-
-    for p_id in reversed(drop_list):
-        players.pop(p_id)
-
-    print("Predictions:", predictions)
-
-    return players, predictions
-
-
-# =====================================================
-# JSON CREATION
-# =====================================================
-
-def create_json(players, actions, frame_len):
-
-    json_list = []
-
-    player_frames = [list(player.bboxs.keys()) for player in players]
-
-    for frame in range(frame_len):
-        for p_idx in range(len(players)):
-            if frame in player_frames[p_idx]:
-                json_list.append({
-                    'player': players[p_idx].ID,
-                    'frame': frame,
-                    'team': players[p_idx].team,
-                    'position': players[p_idx].positions[frame],
-                    'action': players[p_idx].actions.get(frame, "unknown")
+                cnn_events.append({
+                    "type": action_label,
+                    "frame": frame_indices[0],
+                    "team": getattr(player, "team", "unknown"),
+                    "source": "cnn"
                 })
 
-    return json_list
+    print("🔥 CNN Events:", len(cnn_events))
+    return cnn_events
